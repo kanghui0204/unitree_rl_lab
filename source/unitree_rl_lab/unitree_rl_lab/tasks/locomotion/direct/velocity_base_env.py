@@ -31,7 +31,7 @@ import torch
 import warp as wp
 import inspect
 from collections.abc import Sequence
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from isaaclab.envs import DirectRLEnv
 from isaaclab.managers import (
@@ -504,18 +504,24 @@ class UnitreeVelocityDirectEnv(DirectRLEnv):
     # Observation dispatch (replaces ObservationManager)
     # =========================================================================
 
-    def _get_observations(self) -> dict[str, torch.Tensor]:
+    def _get_observations(self, update_history: bool = False) -> dict[str, torch.Tensor]:
         # ``command_manager.compute(step_dt)`` is driven by our :meth:`step`
         # override BEFORE the interval-event apply step, matching
         # :meth:`ManagerBasedRLEnv.step` (manager_based_rl_env.py:239-246).
         # Do NOT add a ``compute`` call here, otherwise the timer is
         # decremented twice per env step.
         return {
-            "policy": self._compute_obs_group(self._policy_cfg, self._policy_obs_terms, self._policy_history_buf),
-            "critic": self._compute_obs_group(self._critic_cfg, self._critic_obs_terms, self._critic_history_buf),
+            "policy": self._compute_obs_group(
+                self._policy_cfg, self._policy_obs_terms, self._policy_history_buf, update_history
+            ),
+            "critic": self._compute_obs_group(
+                self._critic_cfg, self._critic_obs_terms, self._critic_history_buf, update_history
+            ),
         }
 
-    def _compute_obs_group(self, group_cfg, term_specs, history_bufs: dict[str, CircularBuffer]) -> torch.Tensor:
+    def _compute_obs_group(
+        self, group_cfg, term_specs, history_bufs: dict[str, CircularBuffer], update_history: bool
+    ) -> torch.Tensor:
         """Mirror of :meth:`ObservationManager.compute_group` (term pipeline)."""
         outputs: list[torch.Tensor] = []
         for name, func, params, scale, noise_cfg, modifier_cfgs, _term_cfg in term_specs:
@@ -538,7 +544,8 @@ class UnitreeVelocityDirectEnv(DirectRLEnv):
                 obs = obs.mul_(scale)
             buf = history_bufs.get(name)
             if buf is not None:
-                buf.append(obs)
+                if update_history or buf._buffer is None:
+                    buf.append(obs)
                 if _term_cfg.flatten_history_dim:
                     outputs.append(buf.buffer.reshape(self.num_envs, -1))
                 else:
@@ -630,12 +637,35 @@ class UnitreeVelocityDirectEnv(DirectRLEnv):
             if "interval" in self.event_manager.available_modes:
                 self.event_manager.apply(mode="interval", dt=self.step_dt)
 
-        self.obs_buf = self._get_observations()
+        self.obs_buf = self._get_observations(update_history=True)
 
         if self.cfg.observation_noise_model:
             self.obs_buf["policy"] = self._observation_noise_model(self.obs_buf["policy"])
 
         return self.obs_buf, self.reward_buf, self.reset_terminated, self.reset_time_outs, self.extras
+
+    def reset(self, seed: int | None = None, options: dict[str, Any] | None = None):
+        """Reset all environments and fill observation history like ManagerBasedRLEnv.reset."""
+        if seed is not None:
+            self.seed(seed)
+
+        indices = torch.arange(self.num_envs, dtype=torch.int32, device=self.device)
+        self._reset_idx(indices)
+
+        self.scene.write_data_to_sim()
+        self.sim.forward()
+
+        if self.has_rtx_sensors and self.cfg.num_rerenders_on_reset > 0:
+            for _ in range(self.cfg.num_rerenders_on_reset):
+                self.sim.render()
+
+        if self.cfg.wait_for_textures and self.has_rtx_sensors:
+            if hasattr(self.sim.physics_manager, "assets_loading"):
+                while self.sim.physics_manager.assets_loading():
+                    self.sim.render()
+
+        self.obs_buf = self._get_observations(update_history=True)
+        return self.obs_buf, self.extras
 
     # =========================================================================
     # Reset path
